@@ -76,7 +76,7 @@
     <div class="hud" data-page-node-id="1RG4ICJCRUyGi6rpXAPoT8">
         🔗 链条由 <span id="cnt">28</span> 节独立小刚体与转轴铰链构成 · 块三对角直接求解 · 节距恒定不可拉伸、轴承自由转动<br data-page-node-id="B9MBZNgSi2jW6cowtfMhRt">
         🖱️🖐️ 鼠标或手指均可抓取怀表拖拽/抛甩（移动端已禁用默认触摸手势冲突）<br>
-        📱 运动感应需 HTTPS/localhost，iOS 需先点“启用运动感应”授权；不支持时自动降级为固定重力<br>
+        📱 运动感应需 HTTPS/localhost，iOS 需先点“启用运动感应”授权；不支持时自动降级为固定重力。倾斜改变重力方向，甩动时怀表会因惯性短暂滞后<br>
         <span id="err">最大节距误差 0.000 px</span>
     </div>
 
@@ -401,8 +401,19 @@
         const BASE_GRAVITY = 980;  // px/s^2
         let gravityX = 0;
         let gravityY = BASE_GRAVITY;
-        const MOTION_CLAMP_MS2 = 9.8;
-        const MOTION_SMOOTHING = 0.12;
+        let shakeAccelX = 0;
+        let shakeAccelY = 0;
+        const MS2_TO_PX = BASE_GRAVITY / 9.8;
+        const MOTION_BASE_GRAVITY_MS2 = 9.8;
+        const MOTION_GRAVITY_LPF = 0.08;
+        const MOTION_GRAVITY_SMOOTHING = 0.15;
+        const MOTION_LINEAR_DEADZONE_MS2 = 0.06;
+        const MOTION_SHAKE_MAX_MS2 = 5.8;
+        const MOTION_SHAKE_SMOOTHING = 0.35;
+        const MOTION_SHAKE_DAMPING = 8.5;
+        let gravitySensorX = 0;
+        let gravitySensorY = -MOTION_BASE_GRAVITY_MS2;
+        let hasGravityEstimate = false;
         const JOINT_FRICTION = 20; // 铰链摩擦：相邻两节相对角速度的衰减率 (1/s)。
                                    // 只耗散链内部的"蛇形"抖动，整体摆动/旋转不受影响，
                                    // 所以离心力能把链平顺地甩直。0 = 无摩擦的理想轴承
@@ -460,12 +471,15 @@
             for (let step = 0; step < SUBSTEPS; step++) {
                 // 1. 拖拽弹簧
                 if (isDragging) applyDragSpring(h);
+                const shakeDecay = Math.exp(-MOTION_SHAKE_DAMPING * h);
+                shakeAccelX *= shakeDecay;
+                shakeAccelY *= shakeDecay;
 
                 // 2. 半隐式欧拉预测：重力 + 阻尼 + 位置预测
                 for (let i = 0; i < bodies.length; i++) {
                     const b = bodies[i];
-                    b.vx += gravityX * h;
-                    b.vy += gravityY * h;
+                    b.vx += (gravityX + shakeAccelX) * h;
+                    b.vy += (gravityY + shakeAccelY) * h;
                     b.vx *= (1 - 0.06 * h);   // 线性空气阻尼
                     b.vy *= (1 - 0.06 * h);
                     b.omega *= (1 - 0.12 * h); // 角阻尼
@@ -729,6 +743,7 @@
         // ================= 运动感应（可选） =================
         const motionBtn = document.getElementById('motionBtn');
         const motionStatusEl = document.getElementById('motionStatus');
+        let hasMotionSample = false;
 
         function setMotionStatus(text) {
             motionStatusEl.textContent = '运动感应：' + text;
@@ -739,40 +754,97 @@
         }
 
         function getScreenAngle() {
-            if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
-            if (typeof window.orientation === 'number') return window.orientation;
-            return 0;
+            let angle = 0;
+            if (screen.orientation && typeof screen.orientation.angle === 'number') {
+                angle = screen.orientation.angle;
+            } else if (typeof window.orientation === 'number') {
+                angle = window.orientation;
+            }
+            const snapped = Math.round(angle / 90) * 90;
+            return ((snapped % 360) + 360) % 360;
         }
 
         function mapAccelToScreen(ax, ay, angle) {
+            let sx = ax;
+            let sy = ay;
             switch (angle) {
-                case 90: return { x: -ay, y: ax };
+                case 90:
+                    sx = -ay;
+                    sy = ax;
+                    break;
                 case -90:
-                case 270: return { x: ay, y: -ax };
+                case 270:
+                    sx = ay;
+                    sy = -ax;
+                    break;
                 case 180:
-                case -180: return { x: -ax, y: ay };
-                default: return { x: ax, y: -ay };
+                case -180:
+                    sx = -ax;
+                    sy = -ay;
+                    break;
+                default:
+                    sx = ax;
+                    sy = ay;
             }
+            return { x: sx, y: -sy };
         }
 
         function onDeviceMotion(event) {
-            const acc = event.accelerationIncludingGravity;
-            if (!acc) return;
-            let ax = typeof acc.x === 'number' ? acc.x : 0;
-            let ay = typeof acc.y === 'number' ? acc.y : -9.8;
-            ax = clamp(ax, -MOTION_CLAMP_MS2, MOTION_CLAMP_MS2);
-            ay = clamp(ay, -MOTION_CLAMP_MS2, MOTION_CLAMP_MS2);
-            const mapped = mapAccelToScreen(ax, ay, getScreenAngle());
-            const targetGX = clamp((mapped.x / 9.8) * BASE_GRAVITY, -BASE_GRAVITY, BASE_GRAVITY);
-            const targetGY = clamp((mapped.y / 9.8) * BASE_GRAVITY, -BASE_GRAVITY, BASE_GRAVITY);
-            gravityX += (targetGX - gravityX) * MOTION_SMOOTHING;
-            gravityY += (targetGY - gravityY) * MOTION_SMOOTHING;
+            const totalAcc = event.accelerationIncludingGravity;
+            if (!totalAcc) return;
+            if (!hasMotionSample) {
+                hasMotionSample = true;
+                setMotionStatus('已启用（传感器工作中）');
+            }
+
+            const totalX = Number.isFinite(totalAcc.x) ? totalAcc.x : null;
+            const totalY = Number.isFinite(totalAcc.y) ? totalAcc.y : null;
+            if (totalX === null || totalY === null) return;
+
+            if (!hasGravityEstimate) {
+                gravitySensorX = totalX;
+                gravitySensorY = totalY;
+                hasGravityEstimate = true;
+            } else {
+                gravitySensorX += (totalX - gravitySensorX) * MOTION_GRAVITY_LPF;
+                gravitySensorY += (totalY - gravitySensorY) * MOTION_GRAVITY_LPF;
+            }
+
+            const gravNorm = Math.hypot(gravitySensorX, gravitySensorY);
+            if (gravNorm > 0.001) {
+                const gravMs2X = gravitySensorX / gravNorm * MOTION_BASE_GRAVITY_MS2;
+                const gravMs2Y = gravitySensorY / gravNorm * MOTION_BASE_GRAVITY_MS2;
+                const mappedGravity = mapAccelToScreen(gravMs2X, gravMs2Y, getScreenAngle());
+                const targetGX = mappedGravity.x * MS2_TO_PX;
+                const targetGY = mappedGravity.y * MS2_TO_PX;
+                gravityX += (targetGX - gravityX) * MOTION_GRAVITY_SMOOTHING;
+                gravityY += (targetGY - gravityY) * MOTION_GRAVITY_SMOOTHING;
+            }
+
+            const linearAcc = event.acceleration;
+            let linearX = Number.isFinite(linearAcc?.x) ? linearAcc.x : null;
+            let linearY = Number.isFinite(linearAcc?.y) ? linearAcc.y : null;
+            if (linearX === null || linearY === null) {
+                linearX = totalX - gravitySensorX;
+                linearY = totalY - gravitySensorY;
+            }
+
+            if (Math.abs(linearX) < MOTION_LINEAR_DEADZONE_MS2) linearX = 0;
+            if (Math.abs(linearY) < MOTION_LINEAR_DEADZONE_MS2) linearY = 0;
+            linearX = clamp(linearX, -MOTION_SHAKE_MAX_MS2, MOTION_SHAKE_MAX_MS2);
+            linearY = clamp(linearY, -MOTION_SHAKE_MAX_MS2, MOTION_SHAKE_MAX_MS2);
+
+            const mappedLinear = mapAccelToScreen(linearX, linearY, getScreenAngle());
+            const targetShakeX = -mappedLinear.x * MS2_TO_PX;
+            const targetShakeY = -mappedLinear.y * MS2_TO_PX;
+            shakeAccelX += (targetShakeX - shakeAccelX) * MOTION_SHAKE_SMOOTHING;
+            shakeAccelY += (targetShakeY - shakeAccelY) * MOTION_SHAKE_SMOOTHING;
         }
 
         function enableMotionSensor() {
             window.addEventListener('devicemotion', onDeviceMotion);
             motionBtn.disabled = true;
-            setMotionStatus('已启用');
+            setMotionStatus('已启用（等待数据）');
         }
 
         async function requestMotionAccess() {
