@@ -23,6 +23,7 @@
         canvas {
             display: block;
             cursor: grab;
+            touch-action: none;
         }
         canvas:active {
             cursor: grabbing;
@@ -37,14 +38,45 @@
             pointer-events: none;
             line-height: 1.6;
         }
+        .motion-panel {
+            position: absolute;
+            top: 14px;
+            left: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            align-items: flex-start;
+            color: rgba(255, 255, 255, 0.82);
+            font-size: 12px;
+            letter-spacing: 0.3px;
+            z-index: 2;
+        }
+        .motion-panel button {
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            background: rgba(0, 0, 0, 0.4);
+            color: #fff;
+            border-radius: 999px;
+            padding: 7px 12px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .motion-panel button:disabled {
+            opacity: 0.5;
+            cursor: default;
+        }
     </style>
 </head>
 <body data-page-node-id="uGHi4Q5ZWxygNQPoXRVUWX">
 
     <canvas id="canvas" data-page-node-id="QTvAFmKEy7trlC8S2qxbCP"></canvas>
+    <div class="motion-panel">
+        <button id="motionBtn" type="button">启用运动感应</button>
+        <div id="motionStatus">运动感应：未启用</div>
+    </div>
     <div class="hud" data-page-node-id="1RG4ICJCRUyGi6rpXAPoT8">
         🔗 链条由 <span id="cnt">28</span> 节独立小刚体与转轴铰链构成 · 块三对角直接求解 · 节距恒定不可拉伸、轴承自由转动<br data-page-node-id="B9MBZNgSi2jW6cowtfMhRt">
-        🖱️ 鼠标可抓取怀表拖拽或向侧方抛甩<br>
+        🖱️🖐️ 鼠标或手指均可抓取怀表拖拽/抛甩（移动端已禁用默认触摸手势冲突）<br>
+        📱 运动感应需 HTTPS/localhost，iOS 需先点“启用运动感应”授权；不支持时自动降级为固定重力<br>
         <span id="err">最大节距误差 0.000 px</span>
     </div>
 
@@ -303,39 +335,74 @@
             joints[0].worldAx = anchorX;
         });
 
-        // ================= 鼠标抓取 & 抛甩互动 =================
-        // 关键：怀表始终是「动力学刚体」，鼠标只通过一根临界阻尼弹簧去拉它，
+        // ================= 指针抓取 & 抛甩互动（鼠标 + 触摸） =================
+        // 关键：怀表始终是「动力学刚体」，指针只通过一根临界阻尼弹簧去拉它，
         // 而不是把它的位置直接钉到鼠标上。直接钉位置 = 给链尾一次瞬移，链根本来不及
         // 跟上，只能被硬拉长；而且鼠标一旦超出链长，也会把链拽断/拉伸。
         let isDragging = false;
         let mouseX = 0, mouseY = 0;
         let grabDX = 0, grabDY = 0;   // 抓取点相对怀表中心的偏移（抓住哪里就拉哪里，不会跳变）
+        let activePointerId = null;
+        let pendingDrag = false;
+        let pointerDownX = 0, pointerDownY = 0;
+        const DRAG_ACTIVATION_DIST = 4;
 
-        window.addEventListener('mousedown', (e) => {
+        function beginPointerDrag(e) {
+            if (activePointerId !== null) return;
             const dist = Math.hypot(e.clientX - watchBody.x, e.clientY - watchBody.y);
             if (dist < WATCH_RADIUS + 25) {
-                isDragging = true;
+                activePointerId = e.pointerId;
+                pendingDrag = true;
+                pointerDownX = e.clientX;
+                pointerDownY = e.clientY;
+                isDragging = false;
                 mouseX = e.clientX;
                 mouseY = e.clientY;
                 grabDX = watchBody.x - e.clientX;
                 grabDY = watchBody.y - e.clientY;
+                if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+                e.preventDefault();
             }
-        });
+        }
 
-        window.addEventListener('mousemove', (e) => {
+        function updatePointerDrag(e) {
+            if (activePointerId !== e.pointerId) return;
             mouseX = e.clientX;
             mouseY = e.clientY;
-        });
+            if (pendingDrag) {
+                const moved = Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY);
+                if (moved >= DRAG_ACTIVATION_DIST) {
+                    pendingDrag = false;
+                    isDragging = true;
+                }
+            }
+            e.preventDefault();
+        }
 
-        window.addEventListener('mouseup', () => {
+        function endPointerDrag(e) {
+            if (activePointerId !== e.pointerId) return;
+            pendingDrag = false;
             isDragging = false;
-        });
+            activePointerId = null;
+            if (canvas.hasPointerCapture && canvas.hasPointerCapture(e.pointerId)) {
+                canvas.releasePointerCapture(e.pointerId);
+            }
+        }
+
+        canvas.addEventListener('pointerdown', beginPointerDrag, { passive: false });
+        canvas.addEventListener('pointermove', updatePointerDrag, { passive: false });
+        canvas.addEventListener('pointerup', endPointerDrag);
+        canvas.addEventListener('pointercancel', endPointerDrag);
 
         // ================= 主物理循环：子步 + 直接法铰链求解 =================
         const SUBSTEPS = 8;        // 每帧子步数
         const NEWTON_MAX = 8;      // 每子步牛顿迭代上限（残差够小会提前退出，通常 1~3 次）
         const NEWTON_TOL = 1e-4;   // 铰链残差收敛阈值 (px)
-        const GRAVITY = 980;       // px/s^2
+        const BASE_GRAVITY = 980;  // px/s^2
+        let gravityX = 0;
+        let gravityY = BASE_GRAVITY;
+        const MOTION_CLAMP_MS2 = 9.8;
+        const MOTION_SMOOTHING = 0.12;
         const JOINT_FRICTION = 20; // 铰链摩擦：相邻两节相对角速度的衰减率 (1/s)。
                                    // 只耗散链内部的"蛇形"抖动，整体摆动/旋转不受影响，
                                    // 所以离心力能把链平顺地甩直。0 = 无摩擦的理想轴承
@@ -397,7 +464,8 @@
                 // 2. 半隐式欧拉预测：重力 + 阻尼 + 位置预测
                 for (let i = 0; i < bodies.length; i++) {
                     const b = bodies[i];
-                    b.vy += GRAVITY * h;
+                    b.vx += gravityX * h;
+                    b.vy += gravityY * h;
                     b.vx *= (1 - 0.06 * h);   // 线性空气阻尼
                     b.vy *= (1 - 0.06 * h);
                     b.omega *= (1 - 0.12 * h); // 角阻尼
@@ -658,6 +726,100 @@
             ctx.restore();
         }
 
+        // ================= 运动感应（可选） =================
+        const motionBtn = document.getElementById('motionBtn');
+        const motionStatusEl = document.getElementById('motionStatus');
+
+        function setMotionStatus(text) {
+            motionStatusEl.textContent = '运动感应：' + text;
+        }
+
+        function clamp(v, min, max) {
+            return Math.max(min, Math.min(max, v));
+        }
+
+        function getScreenAngle() {
+            if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
+            if (typeof window.orientation === 'number') return window.orientation;
+            return 0;
+        }
+
+        function mapAccelToScreen(ax, ay, angle) {
+            switch (angle) {
+                case 90: return { x: -ay, y: ax };
+                case -90:
+                case 270: return { x: ay, y: -ax };
+                case 180:
+                case -180: return { x: -ax, y: ay };
+                default: return { x: ax, y: -ay };
+            }
+        }
+
+        function onDeviceMotion(event) {
+            const acc = event.accelerationIncludingGravity;
+            if (!acc) return;
+            let ax = typeof acc.x === 'number' ? acc.x : 0;
+            let ay = typeof acc.y === 'number' ? acc.y : -9.8;
+            ax = clamp(ax, -MOTION_CLAMP_MS2, MOTION_CLAMP_MS2);
+            ay = clamp(ay, -MOTION_CLAMP_MS2, MOTION_CLAMP_MS2);
+            const mapped = mapAccelToScreen(ax, ay, getScreenAngle());
+            const targetGX = clamp((mapped.x / 9.8) * BASE_GRAVITY, -BASE_GRAVITY, BASE_GRAVITY);
+            const targetGY = clamp((mapped.y / 9.8) * BASE_GRAVITY, -BASE_GRAVITY, BASE_GRAVITY);
+            gravityX += (targetGX - gravityX) * MOTION_SMOOTHING;
+            gravityY += (targetGY - gravityY) * MOTION_SMOOTHING;
+        }
+
+        function enableMotionSensor() {
+            window.addEventListener('devicemotion', onDeviceMotion);
+            motionBtn.disabled = true;
+            setMotionStatus('已启用');
+        }
+
+        async function requestMotionAccess() {
+            if (!window.isSecureContext) {
+                setMotionStatus('当前环境不支持（需 HTTPS 或 localhost）');
+                motionBtn.disabled = true;
+                return;
+            }
+            if (!('DeviceMotionEvent' in window)) {
+                setMotionStatus('设备/浏览器不支持，已降级为固定重力');
+                motionBtn.disabled = true;
+                return;
+            }
+            try {
+                if (typeof DeviceMotionEvent.requestPermission === 'function') {
+                    const state = await DeviceMotionEvent.requestPermission();
+                    if (state !== 'granted') {
+                        setMotionStatus('权限被拒绝，已降级为固定重力');
+                        return;
+                    }
+                }
+                enableMotionSensor();
+            } catch (err) {
+                setMotionStatus('启用失败，已降级为固定重力');
+            }
+        }
+
+        function initMotionSensorUI() {
+            if (!window.isSecureContext) {
+                setMotionStatus('当前环境不支持（需 HTTPS 或 localhost）');
+                motionBtn.disabled = true;
+                return;
+            }
+            if (!('DeviceMotionEvent' in window)) {
+                setMotionStatus('设备/浏览器不支持，已降级为固定重力');
+                motionBtn.disabled = true;
+                return;
+            }
+            if (typeof DeviceMotionEvent.requestPermission !== 'function') {
+                enableMotionSensor();
+            } else {
+                setMotionStatus('待授权（iOS 需点击按钮）');
+            }
+        }
+
+        motionBtn.addEventListener('click', requestMotionAccess);
+
         // ================= 主循环 =================
         function loop(currentTimestamp) {
             let dt = (currentTimestamp - lastTimestamp) / 1000;
@@ -712,6 +874,7 @@
 
         const errEl = document.getElementById('err');
         document.getElementById('cnt').textContent = LINK_COUNT;
+        initMotionSensorUI();
         requestAnimationFrame(loop);
     </script>
 </body>
