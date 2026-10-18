@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="FcP6imI7rnyCTRFeWgnVWN">
+<head data-page-node-id="oKmI1KojB7b61EGUDZNCE4">
+    <meta charset="UTF-8" data-page-node-id="uKD5mnSlRH7EtBMEh80Ece">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="E3DMKwVSZud0LyPd6rlA1j">
+    <title>小刚体骨骼与转轴铰链链条 - 物理复刻</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background-color: #030303;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+            cursor: grab;
+        }
+        canvas:active {
+            cursor: grabbing;
+        }
+        .hud {
+            position: absolute;
+            bottom: 24px;
+            color: rgba(255, 255, 255, 0.45);
+            font-size: 13px;
+            letter-spacing: 1px;
+            text-align: center;
+            pointer-events: none;
+            line-height: 1.6;
+        }
+    </style>
+</head>
+<body data-page-node-id="uGHi4Q5ZWxygNQPoXRVUWX">
+
+    <canvas id="canvas" data-page-node-id="QTvAFmKEy7trlC8S2qxbCP"></canvas>
+    <div class="hud" data-page-node-id="1RG4ICJCRUyGi6rpXAPoT8">
+        🔗 链条由 <span id="cnt">28</span> 节独立小刚体与转轴铰链构成 · 块三对角直接求解 · 节距恒定不可拉伸、轴承自由转动<br data-page-node-id="B9MBZNgSi2jW6cowtfMhRt">
+        🖱️ 鼠标可抓取怀表拖拽或向侧方抛甩<br>
+        <span id="err">最大节距误差 0.000 px</span>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+
+        let width, height, dpr;
+        function resize() {
+            dpr = window.devicePixelRatio || 1;
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width * dpr;
+            canvas.height = height * dpr;
+            canvas.style.width = width + 'px';
+            canvas.style.height = height + 'px';
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        window.addEventListener('resize', resize);
+
+        // ================= 2D 刚体 (仅平移+自转，无碰撞) =================
+        class RigidBody {
+            constructor(x, y, mass, inertia) {
+                this.x = x; this.y = y;
+                this.prevX = x; this.prevY = y;
+                this.angle = 0;
+                this.prevAngle = 0;
+                // 渲染插值用：上一个物理步开始时的状态 (s*) 与当前画面状态 (r*)
+                this.sx = x; this.sy = y; this.sa = 0;
+                this.rx = x; this.ry = y; this.ra = 0;
+                this.vx = 0; this.vy = 0;
+                this.omega = 0;
+                this.mass = mass;
+                this.invMass = 1 / mass;
+                this.inertia = inertia;
+                this.invInertia = 1 / inertia;
+            }
+        }
+
+        // ================= 铰链约束：块三对角直接求解 =================
+        // 链是串联结构：铰链 k 只连接刚体 k-1 与 k，所以所有铰链约束联立后的
+        // 矩阵 S = J M⁻¹ Jᵀ 是「块三对角」的（2×2 块）。用块 Thomas 算法一次性
+        // 精确解出全部铰链的拉格朗日乘子，而不是逐个铰链迭代（Gauss-Seidel）。
+        // 逐个迭代时修正量一节一节传，遇到悬殊质量比就传不动 → 链被拉长；
+        // 直接法没有「传播」问题。因旋转是非线性的，外套牛顿迭代（每次按当前位形重新
+        // 线性化），通常 1~3 次就收敛到 <0.0001px。
+        const EPS_REG = 1e-6;     // 极微量正则化，防止链接近伸直(奇异)时数值发散
+        let SB = null;            // 复用缓冲区，避免每帧大量小数组分配
+
+        function ensureBuffers(n) {
+            if (SB && SB.n === n) return;
+            const f = () => new Float64Array(n);
+            SB = { n,
+                ia: f(), ib: f(), ic: f(),           // D'⁻¹ (对称: [[ia,ib],[ib,ic]])
+                o00: f(), o01: f(), o10: f(), o11: f(), // 上对角块 O_k = S(k,k+1)
+                m00: f(), m01: f(), m10: f(), m11: f(), // 消元因子 M_k = O_{k-1}ᵀ D'⁻¹_{k-1}
+                rx: f(), ry: f(),                    // 右端项 -C，消元后为 R'
+                lx: f(), ly: f(),                    // 解 λ
+                rAx: f(), rAy: f(), rBx: f(), rBy: f() // 子步起点的世界系力臂
+            };
+        }
+
+        // 每次牛顿迭代调用：按当前位形装配并分解矩阵
+        function factorChain() {
+            const n = joints.length;
+            ensureBuffers(n);
+            const { ia, ib, ic, o00, o01, o10, o11, m00, m01, m10, m11, rAx, rAy, rBx, rBy } = SB;
+            const dxx = new Float64Array(n), dxy = new Float64Array(n), dyy = new Float64Array(n);
+
+            for (let k = 0; k < n; k++) {
+                const j = joints[k];
+                let ax = 0, ay = 0, wA = 0, iA = 0;
+                if (j.a) {
+                    const A = j.a, c = Math.cos(A.angle), s = Math.sin(A.angle);
+                    ax = j.la.x * c - j.la.y * s;
+                    ay = j.la.x * s + j.la.y * c;
+                    wA = A.invMass; iA = A.invInertia;
+                }
+                const B = j.b, c = Math.cos(B.angle), s = Math.sin(B.angle);
+                const bx = j.lb.x * c - j.lb.y * s;
+                const by = j.lb.x * s + j.lb.y * c;
+                const wB = B.invMass, iB = B.invInertia;
+
+                rAx[k] = ax; rAy[k] = ay; rBx[k] = bx; rBy[k] = by;
+                dxx[k] = wA + wB + iA * ay * ay + iB * by * by + EPS_REG;
+                dyy[k] = wA + wB + iA * ax * ax + iB * bx * bx + EPS_REG;
+                dxy[k] = -iA * ax * ay - iB * bx * by;
+            }
+            // 相邻铰链通过共享刚体 (joints[k].b) 耦合
+            for (let k = 0; k < n - 1; k++) {
+                const b = joints[k].b, w = b.invMass, i = b.invInertia;
+                const bx = rBx[k], by = rBy[k];          // 刚体 k 作为 B 的力臂
+                const ax = rAx[k + 1], ay = rAy[k + 1];  // 刚体 k 作为下一铰链 A 的力臂
+                o00[k] = -(w + i * by * ay);
+                o01[k] =  i * by * ax;
+                o10[k] =  i * bx * ay;
+                o11[k] = -(w + i * bx * ax);
+            }
+
+            // 前向消元（仅矩阵部分）
+            let det = dxx[0] * dyy[0] - dxy[0] * dxy[0];
+            ia[0] = dyy[0] / det; ib[0] = -dxy[0] / det; ic[0] = dxx[0] / det;
+            for (let k = 1; k < n; k++) {
+                const p = k - 1;
+                m00[k] = o00[p] * ia[p] + o10[p] * ib[p];
+                m01[k] = o00[p] * ib[p] + o10[p] * ic[p];
+                m10[k] = o01[p] * ia[p] + o11[p] * ib[p];
+                m11[k] = o01[p] * ib[p] + o11[p] * ic[p];
+                const e00 = dxx[k] - (m00[k] * o00[p] + m01[k] * o10[p]);
+                const e01 = dxy[k] - (m00[k] * o01[p] + m01[k] * o11[p]);
+                const e11 = dyy[k] - (m10[k] * o01[p] + m11[k] * o11[p]);
+                det = e00 * e11 - e01 * e01;
+                ia[k] = e11 / det; ib[k] = -e01 / det; ic[k] = e00 / det;
+            }
+        }
+
+        // 用 factorChain 分解好的矩阵求一次修正。返回求解前最大残差 (px)
+        function solveChain() {
+            const n = joints.length;
+            const { ia, ib, ic, o00, o01, o10, o11, m00, m01, m10, m11, rx, ry, lx, ly, rAx, rAy, rBx, rBy } = SB;
+            let resid = 0;
+
+            for (let k = 0; k < n; k++) {
+                const j = joints[k];
+                let pAx, pAy;
+                if (j.a) {
+                    const A = j.a, c = Math.cos(A.angle), s = Math.sin(A.angle);
+                    pAx = A.x + j.la.x * c - j.la.y * s;
+                    pAy = A.y + j.la.x * s + j.la.y * c;
+                } else {
+                    pAx = j.worldAx; pAy = j.worldAy;
+                }
+                const B = j.b, c = Math.cos(B.angle), s = Math.sin(B.angle);
+                rx[k] = -(pAx - (B.x + j.lb.x * c - j.lb.y * s));
+                ry[k] = -(pAy - (B.y + j.lb.x * s + j.lb.y * c));
+                resid = Math.max(resid, Math.hypot(rx[k], ry[k]));
+            }
+
+            // 前向代入
+            for (let k = 1; k < n; k++) {
+                const px = rx[k - 1], py = ry[k - 1];
+                rx[k] -= m00[k] * px + m01[k] * py;
+                ry[k] -= m10[k] * px + m11[k] * py;
+            }
+            // 回代
+            lx[n - 1] = ia[n - 1] * rx[n - 1] + ib[n - 1] * ry[n - 1];
+            ly[n - 1] = ib[n - 1] * rx[n - 1] + ic[n - 1] * ry[n - 1];
+            for (let k = n - 2; k >= 0; k--) {
+                const tx = rx[k] - (o00[k] * lx[k + 1] + o01[k] * ly[k + 1]);
+                const ty = ry[k] - (o10[k] * lx[k + 1] + o11[k] * ly[k + 1]);
+                lx[k] = ia[k] * tx + ib[k] * ty;
+                ly[k] = ib[k] * tx + ic[k] * ty;
+            }
+
+            // 把乘子分配回平移与自转
+            for (let k = 0; k < n; k++) {
+                const j = joints[k], px = lx[k], py = ly[k];
+                if (j.a) {
+                    const A = j.a;
+                    A.x += px * A.invMass;
+                    A.y += py * A.invMass;
+                    A.angle += (rAx[k] * py - rAy[k] * px) * A.invInertia;
+                }
+                const B = j.b;
+                B.x -= px * B.invMass;
+                B.y -= py * B.invMass;
+                B.angle -= (rBx[k] * py - rBy[k] * px) * B.invInertia;
+            }
+            return resid;
+        }
+
+        // 当前最大铰链误差 (仅用于显示/调试)
+        function maxJointError() {
+            let m = 0;
+            for (const j of joints) {
+                let pAx, pAy;
+                if (j.a) {
+                    const c = Math.cos(j.a.angle), s = Math.sin(j.a.angle);
+                    pAx = j.a.x + j.la.x * c - j.la.y * s;
+                    pAy = j.a.y + j.la.x * s + j.la.y * c;
+                } else { pAx = j.worldAx; pAy = j.worldAy; }
+                const c = Math.cos(j.b.angle), s = Math.sin(j.b.angle);
+                m = Math.max(m, Math.hypot(
+                    pAx - (j.b.x + j.lb.x * c - j.lb.y * s),
+                    pAy - (j.b.y + j.lb.x * s + j.lb.y * c)));
+            }
+            return m;
+        }
+
+        // ================= 构建链节与怀表装配体 =================
+        const LINK_COUNT = 28;        // 链节数量
+        const LINK_LEN = 16;          // 单个链环转轴间距 (节距) —— 投影保证不可拉伸
+        const WATCH_RADIUS = 65;      // 怀表半径
+        const WATCH_HANG_OFFSET = 76; // 怀表质心到表把顶端挂环的杠杆长度
+        const ANCHOR_Y = -20;
+
+        let bodies = [];
+        let joints = [];
+        let anchorX = 0;
+        let watchBody;
+        let links = [];
+
+        function initChain() {
+            bodies = [];
+            joints = [];
+            links = [];
+            anchorX = width / 2;
+
+            let prevBody = null;
+
+            // 1. 链节刚体
+            for (let i = 0; i < LINK_COUNT; i++) {
+                const cy = ANCHOR_Y + LINK_LEN / 2 + i * LINK_LEN;
+                const mass = 0.1;
+                const inertia = (1 / 12) * mass * (LINK_LEN * LINK_LEN + 8 * 8);
+                const link = new RigidBody(anchorX, cy, mass, inertia);
+                bodies.push(link);
+                links.push(link);
+
+                joints.push({
+                    a: prevBody,
+                    la: prevBody ? { x: 0, y: LINK_LEN / 2 } : null,
+                    worldAx: prevBody ? 0 : anchorX,
+                    worldAy: prevBody ? 0 : ANCHOR_Y,
+                    b: link,
+                    lb: { x: 0, y: -LINK_LEN / 2 }
+                });
+
+                prevBody = link;
+            }
+
+            // 2. 末端怀表 (质量约为链节的 40 倍：真实的怀表远重于链环，链是被表“拉直”的)
+            const lastLink = links[links.length - 1];
+            const watchY = lastLink.y + LINK_LEN / 2 + WATCH_HANG_OFFSET;
+            const watchMass = 4.0;
+            const watchInertia = 0.5 * watchMass * WATCH_RADIUS * WATCH_RADIUS;
+            watchBody = new RigidBody(anchorX, watchY, watchMass, watchInertia);
+            bodies.push(watchBody);
+
+            joints.push({
+                a: lastLink,
+                la: { x: 0, y: LINK_LEN / 2 },
+                b: watchBody,
+                lb: { x: 0, y: -WATCH_HANG_OFFSET }
+            });
+        }
+
+        resize();
+        initChain();
+
+        window.addEventListener('resize', () => {
+            // 整条链随锚点一起刚性平移（若只挪锚点，会瞬间把第一节拉离）
+            const dx = width / 2 - anchorX;
+            for (const b of bodies) { b.x += dx; b.prevX += dx; b.sx += dx; b.rx += dx; }
+            anchorX = width / 2;
+            joints[0].worldAx = anchorX;
+        });
+
+        // ================= 鼠标抓取 & 抛甩互动 =================
+        // 关键：怀表始终是「动力学刚体」，鼠标只通过一根临界阻尼弹簧去拉它，
+        // 而不是把它的位置直接钉到鼠标上。直接钉位置 = 给链尾一次瞬移，链根本来不及
+        // 跟上，只能被硬拉长；而且鼠标一旦超出链长，也会把链拽断/拉伸。
+        let isDragging = false;
+        let mouseX = 0, mouseY = 0;
+        let grabDX = 0, grabDY = 0;   // 抓取点相对怀表中心的偏移（抓住哪里就拉哪里，不会跳变）
+
+        window.addEventListener('mousedown', (e) => {
+            const dist = Math.hypot(e.clientX - watchBody.x, e.clientY - watchBody.y);
+            if (dist < WATCH_RADIUS + 25) {
+                isDragging = true;
+                mouseX = e.clientX;
+                mouseY = e.clientY;
+                grabDX = watchBody.x - e.clientX;
+                grabDY = watchBody.y - e.clientY;
+            }
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            mouseX = e.clientX;
+            mouseY = e.clientY;
+        });
+
+        window.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+
+        // ================= 主物理循环：子步 + 直接法铰链求解 =================
+        const SUBSTEPS = 8;        // 每帧子步数
+        const NEWTON_MAX = 8;      // 每子步牛顿迭代上限（残差够小会提前退出，通常 1~3 次）
+        const NEWTON_TOL = 1e-4;   // 铰链残差收敛阈值 (px)
+        const GRAVITY = 980;       // px/s^2
+        const JOINT_FRICTION = 20; // 铰链摩擦：相邻两节相对角速度的衰减率 (1/s)。
+                                   // 只耗散链内部的"蛇形"抖动，整体摆动/旋转不受影响，
+                                   // 所以离心力能把链平顺地甩直。0 = 无摩擦的理想轴承
+        const DRAG_OMEGA = 30;     // 拖拽弹簧自然频率 (rad/s)，越大越"跟手"，过大会在剧烈瞬移时失稳
+        const DRAG_MAX_SPEED = 2500; // 拖拽时怀表速度上限 (px/s)
+        // 链完全伸直时是奇异构型；目标点限制在极限伸长的 98.5% 以内
+        const MAX_REACH = (LINK_COUNT * LINK_LEN + WATCH_HANG_OFFSET) * 0.985;
+
+        let lastTimestamp = performance.now();
+        let acc = 0;
+        const FIXED_DT = 1 / 60;
+
+        function applyDragSpring(h) {
+            let tx = mouseX + grabDX, ty = mouseY + grabDY;
+            // 目标点限制在锚点周围的可达圆盘内：鼠标拉得再远，链也只会绷直，不会被拉长
+            const dx = tx - anchorX, dy = ty - ANCHOR_Y;
+            const d = Math.hypot(dx, dy);
+            if (d > MAX_REACH) {
+                tx = anchorX + dx / d * MAX_REACH;
+                ty = ANCHOR_Y + dy / d * MAX_REACH;
+            }
+            const W = watchBody, w = DRAG_OMEGA;
+            W.vx += (w * w * (tx - W.x) - 2 * w * W.vx) * h;
+            W.vy += (w * w * (ty - W.y) - 2 * w * W.vy) * h;
+            const sp = Math.hypot(W.vx, W.vy);
+            if (sp > DRAG_MAX_SPEED) {
+                W.vx *= DRAG_MAX_SPEED / sp;
+                W.vy *= DRAG_MAX_SPEED / sp;
+            }
+        }
+
+        // 铰链摩擦：对每个铰链的两个刚体施加等大反向的力偶矩（角动量守恒）
+        function applyJointFriction(h) {
+            const k = 1 - Math.exp(-JOINT_FRICTION * h);
+            for (let i = 0; i < joints.length; i++) {
+                const j = joints[i], B = j.b;
+                if (j.a) {
+                    const A = j.a;
+                    const dw = (B.omega - A.omega) * k / (A.invInertia + B.invInertia);
+                    A.omega += dw * A.invInertia;
+                    B.omega -= dw * B.invInertia;
+                } else {
+                    B.omega -= B.omega * k;   // 与固定锚点相连的第一节
+                }
+            }
+        }
+
+        function physics(dt) {
+            const h = dt / SUBSTEPS;
+            for (let i = 0; i < bodies.length; i++) {   // 记录本物理步起点，供渲染插值
+                const b = bodies[i];
+                b.sx = b.x; b.sy = b.y; b.sa = b.angle;
+            }
+
+            for (let step = 0; step < SUBSTEPS; step++) {
+                // 1. 拖拽弹簧
+                if (isDragging) applyDragSpring(h);
+
+                // 2. 半隐式欧拉预测：重力 + 阻尼 + 位置预测
+                for (let i = 0; i < bodies.length; i++) {
+                    const b = bodies[i];
+                    b.vy += GRAVITY * h;
+                    b.vx *= (1 - 0.06 * h);   // 线性空气阻尼
+                    b.vy *= (1 - 0.06 * h);
+                    b.omega *= (1 - 0.12 * h); // 角阻尼
+
+                    b.prevX = b.x;
+                    b.prevY = b.y;
+                    b.prevAngle = b.angle;
+
+                    b.x += b.vx * h;
+                    b.y += b.vy * h;
+                    b.angle += b.omega * h;
+                }
+
+                // 3. 铰链约束：直接法精确求解（残差够小就提前收工）
+                // 3. 铰链约束：牛顿迭代 + 直接法（残差够小就提前收工）
+                for (let it = 0; it < NEWTON_MAX; it++) {
+                    factorChain();
+                    if (solveChain() < NEWTON_TOL) break;
+                }
+
+                // 4. 从位置差分回写速度
+                for (let i = 0; i < bodies.length; i++) {
+                    const b = bodies[i];
+                    b.vx = (b.x - b.prevX) / h;
+                    b.vy = (b.y - b.prevY) / h;
+
+                    let dA = b.angle - b.prevAngle;
+                    while (dA > Math.PI) dA -= Math.PI * 2;
+                    while (dA < -Math.PI) dA += Math.PI * 2;
+                    b.omega = dA / h;
+                }
+
+                // 5. 铰链摩擦
+                if (JOINT_FRICTION > 0) applyJointFriction(h);
+            }
+        }
+
+        // ================= 渲染：真实的穿插金属环扣 =================
+        function drawChainLinks() {
+            for (let i = 0; i < links.length; i++) {
+                const link = links[i];
+                const isFaceView = i % 2 === 0;
+
+                ctx.save();
+                ctx.translate(link.rx, link.ry);
+                ctx.rotate(link.ra);
+
+                if (isFaceView) {
+                    // 正面椭圆金属链环 (带中心镂空孔洞)
+                    ctx.beginPath();
+                    ctx.ellipse(0, 0, 4.8, LINK_LEN * 0.65, 0, 0, Math.PI * 2);
+                    ctx.ellipse(0, 0, 2.2, LINK_LEN * 0.42, 0, 0, Math.PI * 2);
+                    ctx.fillStyle = '#101010';
+                    ctx.fill('evenodd');
+
+                    // 金属环高光边缘
+                    ctx.lineWidth = 1.8;
+                    const grad = ctx.createLinearGradient(-5, -LINK_LEN / 2, 5, LINK_LEN / 2);
+                    grad.addColorStop(0, '#555555');
+                    grad.addColorStop(0.3, '#ffffff');
+                    grad.addColorStop(0.65, '#999999');
+                    grad.addColorStop(1, '#222222');
+                    ctx.strokeStyle = grad;
+                    ctx.stroke();
+
+                    // 销轴节点高光微粒
+                    ctx.fillStyle = 'rgba(255, 255, 255, 0.45)';
+                    ctx.beginPath();
+                    ctx.arc(0, -LINK_LEN / 2, 1.2, 0, Math.PI * 2);
+                    ctx.arc(0, LINK_LEN / 2, 1.2, 0, Math.PI * 2);
+                    ctx.fill();
+                } else {
+                    // 侧交错穿插环 (穿过相邻环的孔洞)
+                    ctx.beginPath();
+                    ctx.ellipse(0, 0, 2.4, LINK_LEN * 0.52, 0, 0, Math.PI * 2);
+                    const sideGrad = ctx.createLinearGradient(-3, 0, 3, 0);
+                    sideGrad.addColorStop(0, '#777777');
+                    sideGrad.addColorStop(0.5, '#ffffff');
+                    sideGrad.addColorStop(1, '#333333');
+                    ctx.fillStyle = sideGrad;
+                    ctx.fill();
+
+                    ctx.lineWidth = 0.8;
+                    ctx.strokeStyle = '#1a1a1a';
+                    ctx.stroke();
+                }
+
+                ctx.restore();
+            }
+        }
+
+        // ================= 渲染：走时宝玑指针 =================
+        function drawHands(now, r) {
+            const ms = now.getMilliseconds();
+            const sec = now.getSeconds() + ms / 1000;
+            const min = now.getMinutes() + sec / 60;
+            const hr = (now.getHours() % 12) + min / 60;
+
+            const hrA = (hr / 12) * Math.PI * 2 - Math.PI / 2;
+            const minA = (min / 60) * Math.PI * 2 - Math.PI / 2;
+            const secA = (sec / 60) * Math.PI * 2 - Math.PI / 2;
+
+            // 时针
+            ctx.save();
+            ctx.rotate(hrA);
+            ctx.strokeStyle = '#181818';
+            ctx.lineWidth = 3.6;
+            ctx.beginPath();
+            ctx.moveTo(-8, 0);
+            ctx.lineTo(r * 0.48, 0);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(r * 0.35, 0, 4.2, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+
+            // 分针
+            ctx.save();
+            ctx.rotate(minA);
+            ctx.strokeStyle = '#181818';
+            ctx.lineWidth = 2.2;
+            ctx.beginPath();
+            ctx.moveTo(-12, 0);
+            ctx.lineTo(r * 0.72, 0);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(r * 0.56, 0, 3.4, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+
+            // 秒针 (暗红)
+            ctx.save();
+            ctx.rotate(secA);
+            ctx.strokeStyle = '#a11d1d';
+            ctx.fillStyle = '#a11d1d';
+            ctx.lineWidth = 1.3;
+            ctx.beginPath();
+            ctx.moveTo(-16, 0);
+            ctx.lineTo(r * 0.82, 0);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(0, 0, 3.2, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+
+        // ================= 渲染：怀表主体 =================
+        function drawPocketWatch(r, dynamicAngle) {
+            // 1. 顶部表把旋钮与转轴吊环
+            ctx.save();
+            ctx.translate(0, -WATCH_HANG_OFFSET);
+
+            // 铰接吊环
+            ctx.beginPath();
+            ctx.arc(0, 0, 13, 0, Math.PI * 2);
+            ctx.lineWidth = 3.4;
+            const ringGrad = ctx.createLinearGradient(-13, -10, 13, 10);
+            ringGrad.addColorStop(0, '#ffffff');
+            ringGrad.addColorStop(0.45, '#777777');
+            ringGrad.addColorStop(1, '#ffffff');
+            ctx.strokeStyle = ringGrad;
+            ctx.stroke();
+
+            // 表把柱体
+            ctx.fillStyle = '#888888';
+            ctx.fillRect(-5, 6, 10, 8);
+            ctx.strokeStyle = '#dddddd';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(-5, 6, 10, 8);
+            ctx.restore();
+
+            // 2. 怀表外壳与金属拉丝外圈
+            ctx.save();
+            ctx.shadowColor = 'rgba(0, 0, 0, 0.85)';
+            ctx.shadowBlur = 32;
+            ctx.shadowOffsetY = 16;
+
+            const bezelGrad = ctx.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.1, 0, 0, r + 13);
+            bezelGrad.addColorStop(0, '#ffffff');
+            bezelGrad.addColorStop(0.5, '#999999');
+            bezelGrad.addColorStop(0.78, '#ffffff');
+            bezelGrad.addColorStop(0.92, '#383838');
+            bezelGrad.addColorStop(1, '#111111');
+
+            ctx.beginPath();
+            ctx.arc(0, 0, r + 12, 0, Math.PI * 2);
+            ctx.fillStyle = bezelGrad;
+            ctx.fill();
+            ctx.restore();
+
+            // 内凹细倒角
+            ctx.beginPath();
+            ctx.arc(0, 0, r + 2, 0, Math.PI * 2);
+            ctx.strokeStyle = '#252525';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            // 3. 复古象牙表盘
+            const dialGrad = ctx.createRadialGradient(0, 0, 5, 0, 0, r);
+            dialGrad.addColorStop(0, '#fcf9ef');
+            dialGrad.addColorStop(0.85, '#eee5d3');
+            dialGrad.addColorStop(1, '#cec4ad');
+            ctx.beginPath();
+            ctx.arc(0, 0, r, 0, Math.PI * 2);
+            ctx.fillStyle = dialGrad;
+            ctx.fill();
+
+            // 刻度双环
+            ctx.strokeStyle = '#756c5e';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.arc(0, 0, r - 5, 0, Math.PI * 2);
+            ctx.arc(0, 0, r - 12, 0, Math.PI * 2);
+            ctx.stroke();
+
+            // 4. 刻度线与罗马数字
+            const romans = ['XII', 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI'];
+            ctx.fillStyle = '#201e1a';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.font = 'bold 14px "Times New Roman", Georgia, serif';
+
+            for (let i = 0; i < 60; i++) {
+                const angle = (i / 60) * Math.PI * 2 - Math.PI / 2;
+                const isHour = i % 5 === 0;
+                const ro = r - 5;
+                const ri = isHour ? r - 12 : r - 8;
+
+                ctx.lineWidth = isHour ? 1.8 : 1;
+                ctx.strokeStyle = '#433d34';
+                ctx.beginPath();
+                ctx.moveTo(Math.cos(angle) * ri, Math.sin(angle) * ri);
+                ctx.lineTo(Math.cos(angle) * ro, Math.sin(angle) * ro);
+                ctx.stroke();
+
+                if (isHour) {
+                    const textIdx = i / 5;
+                    const tx = Math.cos(angle) * (r - 21);
+                    const ty = Math.sin(angle) * (r - 21);
+                    ctx.fillText(romans[textIdx], tx, ty);
+                }
+            }
+
+            // 5. 指针
+            drawHands(new Date(), r);
+
+            // 6. 凸面蓝宝石表镜反光 (随刚体真实旋转倾角动态滑动)
+            ctx.save();
+            const glareShift = Math.sin(dynamicAngle) * 14;
+            ctx.beginPath();
+            ctx.ellipse(r * 0.16 + glareShift, -r * 0.26, r * 0.7, r * 0.35, -Math.PI / 4, 0, Math.PI * 2);
+            const glassGrad = ctx.createLinearGradient(-r * 0.4, -r * 0.6, r * 0.4, 0);
+            glassGrad.addColorStop(0, 'rgba(255, 255, 255, 0.46)');
+            glassGrad.addColorStop(0.4, 'rgba(255, 255, 255, 0.08)');
+            glassGrad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+            ctx.fillStyle = glassGrad;
+            ctx.fill();
+            ctx.restore();
+        }
+
+        // ================= 主循环 =================
+        function loop(currentTimestamp) {
+            let dt = (currentTimestamp - lastTimestamp) / 1000;
+            lastTimestamp = currentTimestamp;
+            dt = Math.min(dt, 0.05);
+
+            acc += dt;
+            while (acc >= FIXED_DT) {
+                physics(FIXED_DT);
+                acc -= FIXED_DT;
+            }
+
+            // 渲染插值：物理固定 60Hz，而屏幕可能是 75/120/144Hz 或帧间隔有微小抖动。
+            // 不插值时，有的帧推进 0 步、有的推进 1~2 步，画面就会出现节拍性卡顿（视觉上的"抖"）。
+            // 这里在「上一物理步状态」与「当前状态」之间按累积时间比例插值。
+            const alpha = acc / FIXED_DT;
+            for (let i = 0; i < bodies.length; i++) {
+                const b = bodies[i];
+                b.rx = b.sx + (b.x - b.sx) * alpha;
+                b.ry = b.sy + (b.y - b.sy) * alpha;
+                b.ra = b.sa + (b.angle - b.sa) * alpha;
+            }
+
+            // ================= 画面绘制 =================
+            ctx.clearRect(0, 0, width, height);
+
+            // 聚光灯暗影背景
+            const bgGlow = ctx.createRadialGradient(
+                width / 2, height * 0.48, 40,
+                width / 2, height * 0.48, Math.max(width, height) * 0.7
+            );
+            bgGlow.addColorStop(0, '#151515');
+            bgGlow.addColorStop(0.5, '#080808');
+            bgGlow.addColorStop(1, '#020202');
+            ctx.fillStyle = bgGlow;
+            ctx.fillRect(0, 0, width, height);
+
+            // 1. 绘制小刚体金属锁链
+            drawChainLinks();
+
+            // 2. 绘制大刚体复古怀表
+            ctx.save();
+            ctx.translate(watchBody.rx, watchBody.ry);
+            ctx.rotate(watchBody.ra);
+            drawPocketWatch(WATCH_RADIUS, watchBody.ra);
+            ctx.restore();
+
+            errEl.textContent = '最大节距误差 ' + maxJointError().toFixed(3) + ' px';
+
+            requestAnimationFrame(loop);
+        }
+
+        const errEl = document.getElementById('err');
+        document.getElementById('cnt').textContent = LINK_COUNT;
+        requestAnimationFrame(loop);
+    </script>
+</body>
+</html>
