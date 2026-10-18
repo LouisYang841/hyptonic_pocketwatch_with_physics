@@ -815,8 +815,9 @@
                 const gravMs2X = gravitySensorX / gravNorm * MOTION_BASE_GRAVITY_MS2;
                 const gravMs2Y = gravitySensorY / gravNorm * MOTION_BASE_GRAVITY_MS2;
                 const mappedGravity = mapAccelToScreen(gravMs2X, gravMs2Y, getScreenAngle());
-                const targetGX = mappedGravity.x * MS2_TO_PX;
-                const targetGY = mappedGravity.y * MS2_TO_PX;
+                // 传感器测得的重力分量方向与实际重力加速度相反
+                const targetGX = -mappedGravity.x * MS2_TO_PX;
+                const targetGY = -mappedGravity.y * MS2_TO_PX;
                 gravityX += (targetGX - gravityX) * MOTION_GRAVITY_SMOOTHING;
                 gravityY += (targetGY - gravityY) * MOTION_GRAVITY_SMOOTHING;
             }
